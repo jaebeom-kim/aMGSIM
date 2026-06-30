@@ -41,6 +41,24 @@ def obj_dict(obj):
     return obj.__dict__
 
 
+def normalize_only_ancient(value):
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if value in {"True", "true", "TRUE"}:
+            return True
+        if value in {"False", "false", "FALSE"}:
+            return False
+        if value in {"None", "none", "NONE", "Null", "null", "NULL", "NaN", "nan", ""}:
+            return None
+    raise ValueError(
+        f"Invalid onlyAncient value {value!r}. Use True, False, or None."
+    )
+
+
 def process_genome(
     x,
     dist,
@@ -160,7 +178,9 @@ class Genome:
         # else:
         #     self.onlyAncient = None
         # If it is not modern get the coverage
-        self.onlyAncient = selected_genomes_filt.iloc[0]["onlyAncient"]
+        self.onlyAncient = normalize_only_ancient(
+            selected_genomes_filt.iloc[0]["onlyAncient"]
+        )
         # if taxons.empty:
         #     if self.onlyAncient is not None:
         #         coverage_ancient = selected_genomes_filt.iloc[0]["coverage_ancient"]

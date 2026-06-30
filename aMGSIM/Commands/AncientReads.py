@@ -22,6 +22,7 @@ from Bio import SeqIO
 import itertools
 import gzip
 from mimetypes import guess_type
+from collections.abc import Sequence
 
 debug = False
 
@@ -158,7 +159,9 @@ def process_params_deamSim(params):
         if params[k] is not False:
             if params[k] is True:
                 parms[k] = ""
-            elif type(params[k]) is list:
+            elif isinstance(params[k], Sequence) and not isinstance(
+                params[k], (str, bytes)
+            ):
                 parms[k] = ",".join(map(str, params[k]))
             else:
                 parms[k] = params[k]
@@ -171,7 +174,9 @@ def process_params(params):
         if params[k] is not False:
             if params[k] is True:
                 parms[k] = ""
-            elif type(params[k]) is list:
+            elif isinstance(params[k], Sequence) and not isinstance(
+                params[k], (str, bytes)
+            ):
                 parms[k] = ",".join(map(str, params[k]))
             else:
                 parms[k] = params[k]
@@ -379,6 +384,26 @@ class Returnvalue:
     modern: dict()
 
 
+def fragment_has_reads(x, frag_type):
+    fragments = x.get(f"fragments_{frag_type}")
+    if fragments is None:
+        return False
+    return safe_seq_depth(fragments) > 0
+
+
+def has_simulatable_fragments(x):
+    if x is None or safe_seq_depth(x) <= 0:
+        return False
+    return fragment_has_reads(x, "ancient") or fragment_has_reads(x, "modern")
+
+
+def safe_seq_depth(x):
+    try:
+        return int(x.get("seq_depth", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def collect_file_names(
     x, art_ofile, fragSim_ofile, deamSim_ofile, adptSim_ofile, frag_type, library
 ):
@@ -429,6 +454,9 @@ def generate_fragments(
     debug,
     genome_table,
 ):
+    if not has_simulatable_fragments(x):
+        return None
+
     genome_data = genome_table[(genome_table["Taxon"] == x["taxon"])]
     fasta = genome_data["Fasta_normalized"].item()
     # Create index
@@ -439,6 +467,7 @@ def generate_fragments(
     seq_depth = exp_data["n_reads"]
     files_modern = {}
     files_ancient = {}
+    fragment_files = []
     # Case when onlyAncient is False
     # Here we will need to run for modern and ancient
     if x["onlyAncient"] is False:
@@ -448,6 +477,7 @@ def generate_fragments(
             frag_data = prepare_data_fragments(
                 x=x, frag_type=frag_type, tmp_dir=tmp_dir
             )
+            fragment_files.append(frag_data["fragSim_frag_ofile"])
             run_fragSim(
                 exe=fragSim_exe,
                 params=fragSim_params["ancient"],
@@ -516,6 +546,7 @@ def generate_fragments(
             frag_data = prepare_data_fragments(
                 x=x, frag_type=frag_type, tmp_dir=tmp_dir
             )
+            fragment_files.append(frag_data["fragSim_frag_ofile"])
             run_fragSim(
                 exe=fragSim_exe,
                 params=fragSim_params["modern"],
@@ -555,10 +586,11 @@ def generate_fragments(
                 x=x,
             )
 
-    if x["onlyAncient"] is True:
+    if x["onlyAncient"] is True and x["fragments_ancient"] is not None:
         frag_type = "ancient"
         # Run fragSim
         frag_data = prepare_data_fragments(x=x, frag_type=frag_type, tmp_dir=tmp_dir)
+        fragment_files.append(frag_data["fragSim_frag_ofile"])
         run_fragSim(
             exe=fragSim_exe,
             params=fragSim_params["ancient"],
@@ -619,10 +651,11 @@ def generate_fragments(
             x=x,
         )
         # Regex to parse deamSim headers: (\S+):([+-]):(\d+):(\d+):(\d+)(?:_DEAM:(.*))?
-    if x["onlyAncient"] is None:
+    if x["onlyAncient"] is None and x["fragments_modern"] is not None:
         frag_type = "modern"
         # Run fragSim
         frag_data = prepare_data_fragments(x=x, frag_type=frag_type, tmp_dir=tmp_dir)
+        fragment_files.append(frag_data["fragSim_frag_ofile"])
         run_fragSim(
             exe=fragSim_exe,
             params=fragSim_params["modern"],
@@ -662,7 +695,9 @@ def generate_fragments(
             x=x,
         )
 
-    os.remove(frag_data["fragSim_frag_ofile"])
+    for fragment_file in fragment_files:
+        if os.path.exists(fragment_file):
+            os.remove(fragment_file)
     return Returnvalue(files_ancient, files_modern)
 
 
@@ -1010,6 +1045,17 @@ def get_ancient_reads(args):
         ancient_genomes = json.load(json_file)
     ancient_genomes_data = ancient_genomes["data"]
     ancient_genomes_exp = ancient_genomes["experiment"]
+    n_ancient_genomes_data = len(ancient_genomes_data)
+    ancient_genomes_data = [
+        x for x in ancient_genomes_data if has_simulatable_fragments(x)
+    ]
+    n_skipped = n_ancient_genomes_data - len(ancient_genomes_data)
+    if n_skipped > 0:
+        log.info(
+            f"Skipping {n_skipped} genome records with zero read depth or no fragments..."
+        )
+    if not ancient_genomes_data:
+        raise ValueError("No genome records have positive read depth to simulate.")
     # fragSim_params.pop('ancient_genomes', None)
     genome_lst = []
     for x in ancient_genomes_data:
@@ -1054,12 +1100,18 @@ def get_ancient_reads(args):
         p.close()
         p.join()
         # fragments_data = process_map(func, ancient_genomes_data, max_workers=config_params['cpus'])
+    files = list(filter(None, files))
+    if not files:
+        raise ValueError("No reads were simulated from the ancient-genomes JSON.")
     ancient_files = list(filter(None, map(lambda x: x.ancient, files)))
     modern_files = list(filter(None, map(lambda x: x.modern, files)))
     comms = list(
         set([s["comm"] for s in ancient_files] + [s["comm"] for s in modern_files])
     )
-    files = [item for item in ancient_files[0] if "file" in item]
+    if not comms:
+        raise ValueError("No per-community read files were produced.")
+    file_source = ancient_files[0] if ancient_files else modern_files[0]
+    files = [item for item in file_source if "file" in item]
     files = [item for item in files if "adptSim" not in item]
 
     func = partial(
@@ -1125,3 +1177,4 @@ def get_ancient_reads(args):
 
 
 # %%
+
